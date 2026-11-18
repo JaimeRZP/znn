@@ -11,7 +11,15 @@ try:
 except Exception:  # pragma: no cover - qp missing or unimportable in this env
     QP_INSTALLED = False
 
-__all__ = ["QP_INSTALLED", "DEFAULT_ZMAX", "DEFAULT_QUANTS", "package_pdfs", "predictions_mean_std"]
+__all__ = [
+    "QP_INSTALLED",
+    "DEFAULT_ZMAX",
+    "DEFAULT_QUANTS",
+    "package_pdfs",
+    "predictions_mean_std",
+    "pz_cdf",
+    "pz_ppf",
+]
 
 # The p(z) is a Student-t in log(1 + z), truncated to [0, DEFAULT_ZMAX] and renormalised (its mean in z is infinite
 # without the upper cut). It is stored as a qp interp_irregular ensemble: each object has its own grid, its quantiles at
@@ -31,23 +39,50 @@ _MOMENT_QUANTS = np.concatenate([[0.0], stats.norm.cdf(np.linspace(-6, 6, 601)),
 _CHUNK = 20000  # objects at a time, to bound the memory of the moment integrals
 
 
-def _ppf(q, mu, scale, nu, zmax):
+def pz_ppf(q, mu, scale, nu, zmax=DEFAULT_ZMAX):
     """
-    Quantiles in z, of shape (len(mu), len(q)), of a Student-t in y = log(1 + z) with location mu and scale scale,
-    truncated to z in [0, zmax]. The truncation is applied in the survival function for objects below the middle of
-    the range and in the CDF for those above: for an object far below (above) the range, [0, zmax] is in its upper
-    (lower) tail, where the survival function (CDF) is small and stays resolved in float64.
+    Quantile function of the p(z): the z at quantile level q of a Student-t in y = log(1 + z) with location mu,
+    scale scale and nu degrees of freedom, truncated to z in [0, zmax]. q, mu and scale broadcast against each other
+    (e.g. one quantile level per object). The truncation is applied in the survival function for objects below the
+    middle of the range and in the CDF for those above: for an object far below (above) the range, [0, zmax] is in
+    its upper (lower) tail, where the survival function (CDF) is small and stays resolved in float64.
     """
+    q, mu, scale = np.broadcast_arrays(*(np.asarray(a, dtype=float) for a in (q, mu, scale)))
     y_lo, y_hi = 0.0, np.log1p(zmax)
     lower = mu < 0.5 * (y_lo + y_hi)
-    y = np.empty((mu.size, q.size))
-    m, s = mu[lower, None], scale[lower, None]
+    y = np.empty(q.shape)
+    m, s, p = mu[lower], scale[lower], q[lower]
     s_lo, s_hi = stats.t.sf(y_lo, nu, m, s), stats.t.sf(y_hi, nu, m, s)
-    y[lower] = stats.t.isf(s_lo - q * (s_lo - s_hi), nu, m, s)
-    m, s = mu[~lower, None], scale[~lower, None]
+    y[lower] = stats.t.isf(s_lo - p * (s_lo - s_hi), nu, m, s)
+    m, s, p = mu[~lower], scale[~lower], q[~lower]
     c_lo, c_hi = stats.t.cdf(y_lo, nu, m, s), stats.t.cdf(y_hi, nu, m, s)
-    y[~lower] = stats.t.ppf(c_lo + q * (c_hi - c_lo), nu, m, s)
+    y[~lower] = stats.t.ppf(c_lo + p * (c_hi - c_lo), nu, m, s)
     return np.clip(np.expm1(y), 0.0, zmax)
+
+
+def pz_cdf(z, mu, scale, nu, zmax=DEFAULT_ZMAX):
+    """
+    CDF of the p(z) (see pz_ppf, its inverse): the probability below z of a Student-t in y = log(1 + z) with location
+    mu, scale scale and nu degrees of freedom, truncated to z in [0, zmax]. z, mu and scale broadcast; z outside
+    [0, zmax] gives 0 or 1. Computed from the survival function or the CDF as in pz_ppf.
+    """
+    z, mu, scale = np.broadcast_arrays(*(np.asarray(a, dtype=float) for a in (z, mu, scale)))
+    y = np.log1p(np.clip(z, 0.0, zmax))
+    y_lo, y_hi = 0.0, np.log1p(zmax)
+    lower = mu < 0.5 * (y_lo + y_hi)
+    out = np.empty(z.shape)
+    m, s = mu[lower], scale[lower]
+    s_lo, s_hi = stats.t.sf(y_lo, nu, m, s), stats.t.sf(y_hi, nu, m, s)
+    out[lower] = (s_lo - stats.t.sf(y[lower], nu, m, s)) / (s_lo - s_hi)
+    m, s = mu[~lower], scale[~lower]
+    c_lo, c_hi = stats.t.cdf(y_lo, nu, m, s), stats.t.cdf(y_hi, nu, m, s)
+    out[~lower] = (stats.t.cdf(y[~lower], nu, m, s) - c_lo) / (c_hi - c_lo)
+    return np.clip(out, 0.0, 1.0)
+
+
+def _ppf(q, mu, scale, nu, zmax):
+    """Quantiles in z, of shape (len(mu), len(q)): pz_ppf at the levels q for every object."""
+    return pz_ppf(np.asarray(q)[None, :], np.asarray(mu)[:, None], np.asarray(scale)[:, None], nu, zmax)
 
 
 def _mode(mu, scale, nu, zmax):
