@@ -7,7 +7,8 @@ import tensorflow as tf
 
 assert version.parse(tf.__version__) >= version.parse("2.8.0")
 
-from . import data, io, models, qp_output, stats
+from . import copula, data, io, models, qp_output, stats
+from .copula import *
 from .data import *
 from .io import *
 from .models import *

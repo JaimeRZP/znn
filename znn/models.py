@@ -3,7 +3,6 @@ import pickle
 
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
 from tensorflow.keras import callbacks, layers, models
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY
@@ -17,6 +16,7 @@ __all__ = [
     "train_scale_model",
     "train_model",
     "predict",
+    "latent",
     "save_model_file",
     "load_model_file",
     "load_pretrained",
@@ -108,9 +108,13 @@ class ToRedshift(layers.Layer):
 
 
 def _callbacks():
-    """Early stopping and learning-rate reduction on the validation loss."""
-    early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-    reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
+    """
+    Early stopping and learning-rate reduction on the training loss: the learning rate is halved when the loss stops
+    improving, and training stops once it has not improved for longer. The whole training set is used for training,
+    with no held-out objects.
+    """
+    early_stop = callbacks.EarlyStopping(monitor="loss", patience=5, restore_best_weights=True)
+    reduce_lr = callbacks.ReduceLROnPlateau(monitor="loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
     return [early_stop, reduce_lr]
 
 
@@ -121,12 +125,10 @@ def _start(pretraining):
     return pretraining[0] if isinstance(pretraining, tuple) else pretraining
 
 
-def train_mean_model(
-    build_model_func, X, Y, VAL_FRAC=0.2, EPOCHS=100, BATCH_SIZE=256, random_state=42, pretraining=DEFAULT_PRETRAINING
-):
+def train_mean_model(build_model_func, X, Y, EPOCHS=100, BATCH_SIZE=256, pretraining=DEFAULT_PRETRAINING):
     """
-    Train F, the network predicting the redshift, with MSE on log(1 + z), holding out a random VAL_FRAC of the
-    objects for early stopping. Returns (F, history).
+    Train F, the network predicting the redshift, with MSE on log(1 + z), on all the objects given (early stopping on
+    the training loss). Returns (F, history).
 
     The target is standardised with the training redshifts; a ToRedshift layer appended to the trained network maps
     its output back to z. pretraining: what F starts from: "popcosmos" (default, shipped with znn; X must be built
@@ -135,8 +137,7 @@ def train_mean_model(
     """
     tf.keras.backend.clear_session()
 
-    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
-    T_train, T_val = np.log1p(Y[idx_train]), np.log1p(Y[idx_val])
+    T_train = np.log1p(Y)
 
     start = _start(pretraining)
     if start is None:
@@ -151,9 +152,8 @@ def train_mean_model(
 
     model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse")
     history = model.fit(
-        X[idx_train],
+        X,
         (T_train - Y_mean) / Y_std,
-        validation_data=(X[idx_val], (T_val - Y_mean) / Y_std),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=_callbacks(),
@@ -173,13 +173,12 @@ def _student_t_nll(nu):
     return loss
 
 
-def train_scale_model(
-    build_model_func, X, Y, mean_model, nu=DEFAULT_NU, VAL_FRAC=0.2, EPOCHS=100, BATCH_SIZE=256, random_state=42
-):
+def train_scale_model(build_model_func, X, Y, mean_model, nu=DEFAULT_NU, EPOCHS=100, BATCH_SIZE=256):
     """
     Train G, the network predicting the spread of F's residuals, with F (mean_model) fixed: G learns the log squared
     scale of a Student-t with nu degrees of freedom around F's prediction, by its negative log-likelihood. G is a new
-    instance of build_model_func, from scratch, holding out a random VAL_FRAC for early stopping. Returns (G, history).
+    instance of build_model_func, from scratch, trained on all the objects given (early stopping on the training
+    loss). Returns (G, history).
 
     G is trained in the standardised log(1 + z) of F; a fixed offset appended to the trained network puts its output
     in log(1 + z).
@@ -187,14 +186,12 @@ def train_scale_model(
     to_z = mean_model.layers[-1]
     T_pred = models.Model(mean_model.inputs[0], to_z.input).predict(X, batch_size=4096, verbose=0).ravel()
     R = (np.log1p(Y) - to_z.mean) / to_z.std - T_pred  # F's residuals, in its training units
-    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
 
     model = build_model_func(input_shape=X.shape[1:])
     model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=_student_t_nll(nu))
     history = model.fit(
-        X[idx_train],
-        R[idx_train],
-        validation_data=(X[idx_val], R[idx_val]),
+        X,
+        R,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=_callbacks(),
@@ -210,24 +207,18 @@ def _train_model(
     X,
     Y,
     nu=DEFAULT_NU,
-    VAL_FRAC=0.2,
     EPOCHS=100,
     BATCH_SIZE=256,
-    random_state=42,
     pretraining=DEFAULT_PRETRAINING,
 ):
     """
     Train the model on features X and redshifts Y: F (train_mean_model, from pretraining), then G on F's residuals on
-    the same objects (train_scale_model, from scratch), both with the same VAL_FRAC held out for early stopping.
+    the same objects (train_scale_model, from scratch), both on all the objects given.
 
     Returns ((F, G, nu), (F's history, G's history)).
     """
-    mean_model, mean_history = train_mean_model(
-        build_model_func, X, Y, VAL_FRAC, EPOCHS, BATCH_SIZE, random_state, pretraining
-    )
-    scale_model, scale_history = train_scale_model(
-        build_model_func, X, Y, mean_model, nu, VAL_FRAC, EPOCHS, BATCH_SIZE, random_state
-    )
+    mean_model, mean_history = train_mean_model(build_model_func, X, Y, EPOCHS, BATCH_SIZE, pretraining)
+    scale_model, scale_history = train_scale_model(build_model_func, X, Y, mean_model, nu, EPOCHS, BATCH_SIZE)
     return (mean_model, scale_model, float(nu)), (mean_history, scale_history)
 
 
@@ -240,21 +231,20 @@ def train_model(
     filter_curves=None,
     Y=None,
     nu=DEFAULT_NU,
-    VAL_FRAC=0.2,
     EPOCHS=100,
     BATCH_SIZE=256,
-    random_state=42,
     pretraining=DEFAULT_PRETRAINING,
 ):
     """
     Train the model on a catalogue: its features (catalog_to_XY, on the photometry as given; the photometric errors
-    are not used), then F and G (see the top of this module).
+    are not used), then F and G (see the top of this module), on every object of the catalogue: early stopping and
+    learning-rate reduction follow the training loss. The copula of the model (fit_copula) is then fitted on the same
+    training set.
 
     df: the training catalogue (see znn.io.read_catalog).
     bands, ref_band, config, filter_curves: feature settings, as for catalog_to_XY.
     Y: reference redshifts, in the order of df; by default its "redshift" column.
     nu: degrees of freedom of the Student-t G learns.
-    VAL_FRAC: random fraction held out for early stopping (the same objects for F and G).
     pretraining: what F starts from: "popcosmos" (default, shipped with znn; needs the default feature config), the
         path of a .keras file, a trained model (its F), or None (from scratch). G always starts from scratch.
 
@@ -262,7 +252,25 @@ def train_model(
     """
     X, Y_catalog = catalog_to_XY(df, bands, ref_band, config, filter_curves=filter_curves)
     Y = Y_catalog if Y is None else np.asarray(Y)
-    return _train_model(build_model_func, X, Y, nu, VAL_FRAC, EPOCHS, BATCH_SIZE, random_state, pretraining)
+    return _train_model(build_model_func, X, Y, nu, EPOCHS, BATCH_SIZE, pretraining)
+
+
+def _location_scale(model, X, min_scale=1e-3):
+    """Per-object p(z) parameters of features X: F's prediction mu and G's scale (floored at min_scale), in log(1 + z)."""
+    mean_model, scale_model, _ = model
+    mu = np.log1p(mean_model.predict(X, batch_size=4096, verbose=0).ravel())
+    scale = np.maximum(np.exp(0.5 * scale_model.predict(X, batch_size=4096, verbose=0).ravel()), min_scale)
+    return mu.astype(np.float64), scale.astype(np.float64)
+
+
+def latent(model, X):
+    """
+    F's latent representation of features X: the input of its last Dense layer (the features its prediction is a linear
+    function of), shape (N, n_units). Units that are always zero (dead ReLUs) are included.
+    """
+    mean_model = model[0]
+    head = next(layer for layer in reversed(mean_model.layers) if isinstance(layer, layers.Dense))
+    return models.Model(mean_model.inputs[0], head.input).predict(X, batch_size=4096, verbose=0)
 
 
 def _predict(model, X, ids=None, zmax=DEFAULT_ZMAX, min_scale=1e-3):
@@ -270,10 +278,8 @@ def _predict(model, X, ids=None, zmax=DEFAULT_ZMAX, min_scale=1e-3):
     p(z) of features X with a trained model (F, G, nu): a Student-t in log(1 + z) with F's prediction as location,
     G's scale (floored at min_scale) and nu degrees of freedom, truncated to z in [0, zmax] (see package_pdfs).
     """
-    mean_model, scale_model, nu = model
-    mu = np.log1p(mean_model.predict(X, batch_size=4096, verbose=0).ravel())
-    scale = np.maximum(np.exp(0.5 * scale_model.predict(X, batch_size=4096, verbose=0).ravel()), min_scale)
-    return package_pdfs(mu, scale, nu, ids=ids, zmax=zmax)
+    mu, scale = _location_scale(model, X, min_scale)
+    return package_pdfs(mu, scale, model[2], ids=ids, zmax=zmax)
 
 
 def predict(
