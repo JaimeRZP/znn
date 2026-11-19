@@ -88,6 +88,25 @@ def test_student_t_nll_minimised_at_true_scale():
     assert grid[np.argmin(values)] == pytest.approx(s, abs=0.01)
 
 
+# --- training ----------------------------------------------------------------------------------------------------
+
+
+def test_train_model_uses_every_object_without_validation(catalog, bands, feature_config):
+    """train_model trains on the whole catalogue it is given (no internal split): early stopping on the training loss."""
+    tf.keras.utils.set_random_seed(0)
+    model, (h_mean, h_scale) = znn.train_model(
+        build_model, catalog, bands, "i", feature_config, EPOCHS=2, BATCH_SIZE=8, pretraining=None
+    )
+    F, G, nu = model
+    assert nu == znn.DEFAULT_NU and isinstance(F.layers[-1], ToRedshift)
+    for h in (h_mean, h_scale):
+        assert "loss" in h.history and "val_loss" not in h.history
+        assert h.params["steps"] == int(np.ceil(len(catalog) / 8))  # every object, in batches of 8
+
+    X, _ = catalog_to_XY(catalog, bands, "i", feature_config)
+    assert np.all(np.isfinite(F.predict(X, verbose=0))) and np.all(np.isfinite(G.predict(X, verbose=0)))
+
+
 # --- save / load -------------------------------------------------------------------------------------------------
 
 
