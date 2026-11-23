@@ -13,12 +13,13 @@ from tensorflow.keras import models
 from scipy.optimize import minimize_scalar
 
 from znn.copula import (
+    _bin_mean_directions,
     _bin_pit_means,
-    _bin_similarity,
-    _copula_bin_variance,
+    _copula_bin_covariance,
     _cos_theta,
     _fit_copula,
     _fit_rho,
+    _neg_log_likelihood,
     _pca_basis,
     _pca_projection,
     _sample,
@@ -172,7 +173,7 @@ def test_draws_do_not_depend_on_chunk():
     np.testing.assert_array_equal(a, b)
 
 
-# --- fit of rho (Eqs. pit-bin, var_2 and copula_fit) ---------------------------------------------------------------
+# --- fit of rho (Eqs. pit-bin, neuron-copula_var and copula_fit) -------------------------------------------------------------
 
 
 def _clustered_points(n, n_clusters=40, seed=0):
@@ -185,47 +186,51 @@ def _clustered_points(n, n_clusters=40, seed=0):
     return xi, c
 
 
-def test_bin_similarity_matches_the_pairwise_sum():
-    """S_q = M_q^-2 sum_{j != j'} cos(theta_jj'), against the explicit M_q x M_q sum."""
-    xi, q = _clustered_points(300, n_clusters=5)
-    w = _pca_projection(_copula(xi, 0.3), xi)
-    S_q = _bin_similarity(w, q, 5)
-    for k in range(5):
-        cos = _cos_theta(w[q == k], w[q == k])
-        m = (q == k).sum()
-        assert S_q[k] == pytest.approx((cos.sum() - np.trace(cos)) / m**2, rel=1e-10)
+def test_bin_covariance_matches_the_pairwise_sums():
+    """Sigma_qq' = rho M_q^-1 M_q'^-1 sum_{j in q, j' in q'} cos(theta_jj') + delta_qq' (1 - rho) / M_q, against the
+    explicit sums; the diagonal is Var(g_q) = 1 / M_q + rho M_q^-2 sum_{j != j'} cos(theta_jj')."""
+    rho, n_bins = 0.3, 5
+    xi, q = _clustered_points(300, n_clusters=n_bins)
+    w = _pca_projection(_copula(xi, rho), xi)
+    M_q = np.bincount(q, minlength=n_bins).astype(float)
+    sigma = _copula_bin_covariance(rho, M_q, _bin_mean_directions(w, q, n_bins))
+    for k in range(n_bins):
+        for l in range(n_bins):
+            cos = _cos_theta(w[q == k], w[q == l])
+            expected = rho * cos.mean() + (k == l) * (1 - rho) / M_q[k]
+            assert sigma[k, l] == pytest.approx(expected, rel=1e-10)
+        off_diagonal = (_cos_theta(w[q == k], w[q == k]).sum() - M_q[k]) / M_q[k] ** 2
+        assert sigma[k, k] == pytest.approx(1 / M_q[k] + rho * off_diagonal, rel=1e-10)
 
 
-def test_copula_bin_variance_is_the_variance_of_the_mean_pit_score():
-    """Eq. var_2 against the scatter of u_q over many realisations of Eq. neuron-copula."""
+def test_bin_covariance_is_the_covariance_of_the_mean_pit_scores():
+    """Eq. neuron-copula_var against the covariance of u_q over many realizations of Eq. neuron-copula."""
     rho, n_real, n_bins = 0.3, 4000, 5
     xi, q = _clustered_points(200, n_clusters=n_bins, seed=1)
     w = _pca_projection(_copula(xi, rho), xi)
     rng = np.random.default_rng(2)
     g = _sample_g(w, rng.standard_normal((w.shape[1], n_real)), rng.standard_normal((len(w), n_real)), rho)
     u_q = np.array([_bin_pit_means(g[:, r], q, n_bins)[0] for r in range(n_real)])
-    M_q = np.bincount(q, minlength=n_bins)
-    np.testing.assert_allclose(u_q.var(axis=0), _copula_bin_variance(rho, M_q, _bin_similarity(w, q, n_bins)),
-                               rtol=0.1)
+    M_q = np.bincount(q, minlength=n_bins).astype(float)
+    sigma = _copula_bin_covariance(rho, M_q, _bin_mean_directions(w, q, n_bins))
+    np.testing.assert_allclose(np.cov(u_q, rowvar=False), sigma, atol=0.1 * np.diag(sigma).max())
 
 
-def test_fit_is_the_maximum_of_the_gaussian_likelihood_of_the_bin_means():
-    """The iterated weighted least squares of Eq. copula_fit converges to the maximum-likelihood rho."""
+def test_fit_is_the_maximum_of_the_gaussian_likelihood():
+    """_fit_rho maximises log N(u | 0, Sigma(rho)) (Eq. copula_fit): checked against a fine grid."""
     rng = np.random.default_rng(3)
-    M_q = rng.integers(1, 2000, 60).astype(float)
-    S_q = rng.uniform(0.0, 0.3, 60)
-    u_q = np.sqrt(_copula_bin_variance(0.2, M_q, S_q)) * rng.standard_normal(60)
-
-    def neg2loglike(rho):
-        v = _copula_bin_variance(rho, M_q, S_q)
-        return np.sum(np.log(v) + u_q**2 / v)
-
-    ml = minimize_scalar(neg2loglike, bounds=(0.0, 0.99), method="bounded", options=dict(xatol=1e-10)).x
-    assert _fit_rho(u_q, M_q, S_q) == pytest.approx(ml, abs=1e-6)
+    xi, q = _clustered_points(3000, n_clusters=30, seed=4)
+    w = _pca_projection(_copula(xi, 0.3), xi)
+    u_q, M_q = _bin_pit_means(_sample_g(w, rng.standard_normal((13, 1)), rng.standard_normal((len(w), 1)), 0.3)[:, 0],
+                              q, 30)
+    wbar_q = _bin_mean_directions(w, q, 30)
+    grid = np.linspace(0, 0.99, 2000)
+    best = grid[np.argmin([_neg_log_likelihood(r, u_q, M_q, wbar_q) for r in grid])]
+    assert _fit_rho(u_q, M_q, wbar_q) == pytest.approx(best, abs=1e-3)
 
 
-def test_fit_ignores_empty_bins_and_needs_similarity():
-    assert _fit_rho(np.array([0.1, 0.0]), np.array([1.0, 0.0]), np.array([0.0, 0.0])) == 0.0
+def test_fit_ignores_bins_with_fewer_than_two_objects():
+    assert _fit_rho(np.array([0.1, 0.0]), np.array([1.0, 0.0]), np.zeros((2, 3))) == 0.0
 
 
 @pytest.mark.parametrize("rho_true", [0.0, 0.2, 0.5])
@@ -234,12 +239,12 @@ def test_fit_recovers_rho(rho_true):
     rng = np.random.default_rng(10)
     xi, q = _clustered_points(4000, seed=11)
     w = _pca_projection(_copula(xi, rho_true), xi)
-    S_q = _bin_similarity(w, q, 40)
+    wbar_q = _bin_mean_directions(w, q, 40)
     estimates = []
     for _ in range(10):  # a has only 13 components, shared by all bins: average over a few fields
         u = _sample_g(w, rng.standard_normal((13, 1)), rng.standard_normal((len(w), 1)), rho_true)[:, 0]
         u_q, M_q = _bin_pit_means(u, q, 40)
-        estimates.append(_fit_rho(u_q, M_q, S_q))
+        estimates.append(_fit_rho(u_q, M_q, wbar_q))
     assert np.mean(estimates) == pytest.approx(rho_true, abs=0.1)
 
 
