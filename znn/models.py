@@ -25,13 +25,6 @@ __all__ = [
     "DEFAULT_NU",
 ]
 
-# The model is a pair of networks after the moment networks of Jeffrey & Wandelt 2020 (arXiv:2011.05991): F predicts
-# the redshift, and G, trained on F's residuals with F fixed, predicts their spread. G predicts the log squared scale
-# of a Student-t with nu degrees of freedom, trained by its negative log-likelihood: eq. 5 of the paper (MSE on the
-# squared residuals, i.e. the variance) is the nu -> infinity limit, but is dominated by the rare catastrophic
-# residuals and gives too wide p(z)s. A trained model is the tuple (F, G, nu): F outputs z (it ends in ToRedshift),
-# G the log squared scale in log(1 + z), and the p(z) is that Student-t in log(1 + z) around log(1 + F).
-
 # Pre-trained models shipped with znn, as <name>.keras: "popcosmos" is an F trained on the pop-cosmos mock, on the
 # default feature grid (see README)
 PRETRAINED_DIR = os.path.join(os.path.dirname(__file__), "pretrained")
@@ -68,9 +61,6 @@ def _residual_se_block(x, width, kernel_size=3):
 
 
 def build_model(input_shape):
-    # The model: residual squeeze-excitation net with a kernel-7 stem (conv, batch norm, ReLU), 3 stages
-    # (32/64/128 filters) of 2 blocks each, pooling after the first two stages (32 -> 16 -> 8 positions), then a
-    # dense head. ~270k parameters. Used for both F and G (see train_model)
     inputs = layers.Input(shape=input_shape)
     x = layers.Conv1D(32, kernel_size=7, padding="same", use_bias=False)(inputs)
     x = layers.BatchNormalization()(x)
@@ -108,11 +98,6 @@ class ToRedshift(layers.Layer):
 
 
 def _callbacks():
-    """
-    Early stopping and learning-rate reduction on the training loss: the learning rate is halved when the loss stops
-    improving, and training stops once it has not improved for longer. The whole training set is used for training,
-    with no held-out objects.
-    """
     early_stop = callbacks.EarlyStopping(monitor="loss", patience=5, restore_best_weights=True)
     reduce_lr = callbacks.ReduceLROnPlateau(monitor="loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
     return [early_stop, reduce_lr]

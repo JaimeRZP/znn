@@ -1,38 +1,6 @@
-"""
-Correlated sampling of the redshifts of many objects, leaving every object's own p(z) unchanged (a Gaussian copula).
-
-Drawing each object's redshift independently from its p(z) gives n(z) realizations whose spread falls as 1/sqrt(M),
-far narrower than the actual error of a stacked n(z): objects the model sees as similar share part of their error.
-The functions of this module follow the equations of the write-up (Sect. "Correlated redshift samples and n(z)
-realisations"):
-
-    Eq. copula          z_j = CDF_j^-1(Phi(g_j)),  g ~ N(0, K), K_jj = 1               _redshifts_from_g
-    Eq. pca             w_j = Lambda^-1/2 V^T (xi_j - <xi>),  Sigma_xi = V Lambda V^T   _pca_basis, _pca_projection
-    Eq. similarity      cos(theta_jj') = w_j . w_j' / (|w_j| |w_j'|)                    _cos_theta
-    Eq. neuron-corr     K_jj' = rho cos(theta_jj')
-    Eq. neuron-copula   g_j = sqrt(rho) w_j . a / |w_j| + sqrt(1 - rho) eps_j           _sample_g
-    Eq. pit-score       u_j = Phi^-1(CDF_j(z_j))                                         _pit_scores
-    Eq. var_2           Var(g_q) = 1 / M_q + rho S_q,                                     _copula_bin_variance
-                        S_q = M_q^-2 sum_{j != j' in q} cos(theta_jj')                   _bin_similarity
-    Eq. pit-bin         u_q = M_q^-1 sum_{j in q} u_j                                     _bin_pit_means
-    Eq. copula_fit      min_rho sum_q w_q (u_q^2 - Var(g_q))^2,  w_q = Var(g_q)^-2      _fit_rho
-
-xi_j are the activations entering F's last layer (latent), restricted to the units active on the training set; a ~
-N(0, I) is common to all objects and eps_j ~ N(0, 1) independent. The objects are grouped into the n(z) bins (by
-default 60 bins of width 0.05 on [0, 3]) by the mode of their p(z). rho, <xi> and Sigma_xi come from the training
-set, the same labelled objects F and H were trained on.
-
-Implementation details, not in the equations:
-- the weights of Eq. copula_fit depend on rho: they are held at the previous estimate and the (linear) least squares
-  iterated to convergence; the fixed point is the maximum of the Gaussian likelihood of the u_q;
-- catastrophic outliers (|u_j| > outlier) are left out of the fit, and the u_j divided by their standard deviation
-  over the fit sample, so that rho describes the correlations rather than the calibration of the p(z)s;
-- eigenvalues of Sigma_xi below 1e-12 of the largest are floored; an object exactly at <xi> (w_j = 0) has no
-  direction and is sampled independently.
-"""
-
 import numpy as np
 from scipy import stats
+from scipy.optimize import minimize_scalar
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY
 from .models import _location_scale, latent
@@ -54,10 +22,6 @@ _EIG_FLOOR = 1e-12
 #   n_fit      number of objects rho was fitted on (outliers excluded)
 #   n_bins     number of n(z) bins with at least one of them
 #   pit_std    standard deviation of the u_j of the fit sample (divided out before the fit)
-
-
-# --- similarity in the latent space ---------------------------------------------------------------------------------
-
 
 def _pca_basis(xi):
     """Units active on the training set, their mean <xi> and Lambda^-1/2 V^T (Eq. pca), from training latents xi."""
@@ -85,9 +49,6 @@ def _cos_theta(w1, w2):
     return _unit(np.atleast_2d(w1)) @ _unit(np.atleast_2d(w2)).T
 
 
-# --- sampling -------------------------------------------------------------------------------------------------------
-
-
 def _sample_g(w, a, eps, rho):
     """
     g_j = sqrt(rho) w_j . a / |w_j| + sqrt(1 - rho) eps_j (Eq. neuron-copula), for the columns (draws) of a (n_active,
@@ -101,9 +62,6 @@ def _sample_g(w, a, eps, rho):
 def _redshifts_from_g(g, mu, scale, nu, zmax=DEFAULT_ZMAX):
     """z_j = CDF_j^-1(Phi(g_j)) (Eq. copula), for g of shape (N, n_draws) and p(z) parameters mu, scale (N,)."""
     return pz_ppf(stats.norm.cdf(g), mu[:, None], scale[:, None], nu, zmax)
-
-
-# --- fit of rho -----------------------------------------------------------------------------------------------------
 
 
 def _pit_scores(z_ref, mu, scale, nu, zmax=DEFAULT_ZMAX):
@@ -123,46 +81,44 @@ def _bin_pit_means(u, q, n_bins):
     return u_q, M_q
 
 
-def _bin_similarity(w, q, n_bins):
-    """
-    S_q = M_q^-2 sum_{j != j' in q} cos(theta_jj') (Eq. var_2), without forming the M_q x M_q matrix:
-    sum_{j, j'} cos(theta_jj') = |sum_j w_j / |w_j||^2, from which the diagonal (sum_j |w_j / |w_j||^2) is removed.
-    """
+def _bin_mean_directions(w, q, n_bins):
+    """wbar_q = M_q^-1 sum_{j in q} w_j / |w_j|, shape (n_bins, n_active) (zero rows for empty bins)."""
     d = _unit(w)
-    d_sum = np.zeros((n_bins, d.shape[1]))
-    np.add.at(d_sum, q, d)
-    diagonal = np.bincount(q, weights=np.sum(d**2, axis=1), minlength=n_bins)
+    wbar = np.zeros((n_bins, d.shape[1]))
+    np.add.at(wbar, q, d)
     M_q = np.bincount(q, minlength=n_bins).astype(np.float64)
-    return (np.sum(d_sum**2, axis=1) - diagonal) / np.maximum(M_q, 1) ** 2
+    return wbar / np.maximum(M_q, 1)[:, None]
 
 
-def _copula_bin_variance(rho, M_q, S_q):
-    """Var(g_q) = 1 / M_q + rho S_q (Eq. var_2): the variance of the mean PIT score of a bin predicted by the copula."""
-    return 1 / M_q + rho * S_q
-
-
-def _fit_rho(u_q, M_q, S_q, max_iter=200, tol=1e-10):
+def _copula_bin_covariance(rho, M_q, wbar_q):
     """
-    rho minimising sum_q w_q (u_q^2 - Var(g_q))^2 with w_q = Var(g_q)^-2 (Eq. copula_fit), over the bins with M_q > 0.
-    Var(g_q) is linear in rho: with the weights held at the previous rho the minimum is closed form, and it is
-    iterated (from the unweighted solution) to convergence.
+    Sigma_qq' = rho wbar_q . wbar_q' + delta_qq' (1 - rho) / M_q (Eq. neuron-copula_var): the covariance of the mean PIT scores
+    of the bins predicted by the copula. Its diagonal is Var(g_q) = 1 / M_q + rho S_q, with
+    S_q = M_q^-2 sum_{j != j' in q} cos(theta_jj').
     """
-    keep = M_q > 0
-    u_q, M_q, S_q = u_q[keep], M_q[keep], S_q[keep]
+    shared = np.sqrt(rho) * wbar_q
+    return shared @ shared.T + np.diag((1 - rho) / M_q)
 
-    def weighted_least_squares(w_q):
-        den = np.sum(w_q * S_q**2)
-        if den <= 0:
-            return 0.0
-        return float(np.clip(np.sum(w_q * S_q * (u_q**2 - 1 / M_q)) / den, 0.0, _RHO_MAX))
 
-    rho = weighted_least_squares(np.ones_like(S_q))
-    for _ in range(max_iter):
-        new = weighted_least_squares(_copula_bin_variance(rho, M_q, S_q) ** -2.0)
-        if abs(new - rho) < tol:
-            return new
-        rho = new
-    return rho
+def _neg_log_likelihood(rho, u_q, M_q, wbar_q):
+    """-log N(u | 0, Sigma(rho)), up to a constant."""
+    L = np.linalg.cholesky(_copula_bin_covariance(rho, M_q, wbar_q))
+    y = np.linalg.solve(L, u_q)
+    return float(np.sum(np.log(np.diag(L))) + 0.5 * y @ y)
+
+
+def _fit_rho(u_q, M_q, wbar_q, min_count=2):
+    """
+    rho maximising the Gaussian likelihood of the measured mean PIT scores of the bins, u ~ N(0, Sigma(rho))
+    (Eq. copula_fit), over the bins with at least min_count objects.
+    """
+    keep = M_q >= min_count
+    if not keep.any():
+        return 0.0
+    u_q, M_q, wbar_q = u_q[keep], M_q[keep], wbar_q[keep]
+    res = minimize_scalar(_neg_log_likelihood, bounds=(0.0, _RHO_MAX), args=(u_q, M_q, wbar_q), method="bounded",
+                          options=dict(xatol=1e-8))
+    return float(res.x)
 
 
 def _fit_copula(xi, mu, scale, nu, z_ref, outlier=4.0, bins=DEFAULT_NZ_BINS, zmax=DEFAULT_ZMAX):
@@ -176,8 +132,8 @@ def _fit_copula(xi, mu, scale, nu, z_ref, outlier=4.0, bins=DEFAULT_NZ_BINS, zma
     q = _nz_bin_index(_mode(mu[keep], scale[keep], nu, zmax), bins)
     n_bins = len(bins) - 1
     u_q, M_q = _bin_pit_means(u[keep] / pit_std, q, n_bins)
-    S_q = _bin_similarity(_pca_projection(copula, xi[keep]), q, n_bins)
-    copula.update(rho=_fit_rho(u_q, M_q, S_q), bins=bins, n_fit=int(keep.sum()), n_bins=int(np.sum(M_q > 0)),
+    wbar_q = _bin_mean_directions(_pca_projection(copula, xi[keep]), q, n_bins)
+    copula.update(rho=_fit_rho(u_q, M_q, wbar_q), bins=bins, n_fit=int(keep.sum()), n_bins=int(np.sum(M_q > 0)),
                   pit_std=pit_std)
     return copula
 
